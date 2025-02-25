@@ -4,6 +4,7 @@ const session = require('express-session');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const multer = require('multer');
 const path = require('path');
@@ -25,48 +26,31 @@ const asyncHandler = (fn) => (req, res, next) =>
 // ==========================
 app.use(helmet());
 app.set('trust proxy', 1); // Required to handle X-Forwarded-For via ngrok
-
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100,
 });
 app.use(limiter);
 
-/**
- * Hardcode your allowed client URLs here:
- * 1) The Firebase hosting domain
- * 2) Your ngrok domain
- * 
- * If you add more, simply push them into this array.
- */
-const allowedOrigins = [
-  'https://squarecloudinventorysystem.web.app',
-  'https://4cf3-211-25-11-204.ngrok-free.app',
-];
+const allowedOrigins = process.env.CLIENT_URLS
+  ? process.env.CLIENT_URLS.split(',')
+  : [];
 
-// Custom CORS Middleware – DO NOT use any additional `cors()` library
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  
-  // Allow requests if:
-  //   - the origin is undefined (e.g., Postman or a native mobile app)
-  //   - the origin is in our array of allowed domains
-  if (!origin || allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    // Add ngrok skip warning header for convenience
-    res.setHeader('ngrok-skip-browser-warning', 'true');
-    
-    if (req.method === 'OPTIONS') {
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+    if (req.method === "OPTIONS") {
       return res.sendStatus(204);
     }
-  } else {
-    console.warn(`CORS blocked request from: ${origin}`);
   }
   next();
 });
+
 
 app.use(express.json());
 app.use(cookieParser());
@@ -80,9 +64,9 @@ app.use(
     resave: false,
     saveUninitialized: false,
     cookie: {
-      secure: true,       // Required for HTTPS (ngrok + Firebase)
+      secure: true,       // ✅ Required for HTTPS (ngrok)
       httpOnly: true,
-      sameSite: 'None',   // Needed for cross-origin cookies
+      sameSite: 'None',   // ✅ Needed for cross-origin cookies
     },
   })
 );
@@ -124,6 +108,7 @@ const authenticateJWT = (req, res, next) => {
 };
 
 const authenticateAdmin = (req, res, next) => {
+  // First check JWT, then verify admin role
   authenticateJWT(req, res, () => {
     if (req.user.role_id !== 1) {
       return res.status(403).json({ message: 'Forbidden – admin only' });
@@ -192,7 +177,9 @@ app.post(
         .json({ message: 'Username and password are required.' });
     }
 
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [
+      username,
+    ]);
     if (result.rows.length === 0) {
       return res.status(400).json({ message: 'User not found' });
     }
@@ -225,8 +212,8 @@ app.post(
     // Send access token as cookie
     res.cookie('token', accessToken, {
       httpOnly: true,
-      sameSite: 'None', // Ensures cross-site usage
-      secure: true,     // For HTTPS
+      sameSite: 'None', // ✅ Ensures cross-site usage
+      secure: true,     // ✅ For HTTPS
     });
 
     res.json({
@@ -253,6 +240,7 @@ app.post('/refresh', (req, res) => {
       JWT_SECRET,
       { expiresIn: JWT_EXPIRATION }
     );
+    // Return new access token as cookie
     res.cookie('token', newAccessToken, {
       httpOnly: true,
       sameSite: 'None',
@@ -325,17 +313,19 @@ app.patch(
     }
     const currentItem = itemRows[0];
 
-    // 3. Prepare new values
+    // 3. Prepare new values, defaulting to existing
     let newQuantity = currentItem.quantity;
     let newPrice = currentItem.price;
-    const newSiteName = site_name !== undefined ? site_name : currentItem.site_name;
+    const newSiteName =
+      site_name !== undefined ? site_name : currentItem.site_name;
 
+    // 4. Track which fields changed
     let isQuantityUpdated = false;
     let isPriceUpdated = false;
     let isSiteUpdated = false;
     let isRemarksUpdated = false;
 
-    // Handle quantity
+    // 5. Handle quantity
     if (quantityChange !== undefined) {
       const parsedQty = parseInt(quantityChange, 10);
       if (isNaN(parsedQty)) {
@@ -350,7 +340,7 @@ app.patch(
       }
     }
 
-    // Handle price
+    // 6. Handle price
     if (price !== undefined) {
       const parsedPrice = parseFloat(price);
       if (isNaN(parsedPrice) || parsedPrice < 0) {
@@ -362,17 +352,17 @@ app.patch(
       }
     }
 
-    // Handle site name
+    // 7. Handle site name
     if (site_name !== undefined && site_name !== currentItem.site_name) {
       isSiteUpdated = true;
     }
 
-    // Handle remarks
+    // 8. Handle remarks
     if (remarks !== undefined && remarks !== currentItem.remarks) {
       isRemarksUpdated = true;
     }
 
-    // If no changes, do nothing
+    // 9. If no changes, return early
     if (
       !isQuantityUpdated &&
       !isPriceUpdated &&
@@ -411,7 +401,9 @@ app.patch(
     if (isQuantityUpdated) {
       const parsedQty = parseInt(quantityChange, 10);
       const changeType = parsedQty > 0 ? 'Add' : 'Subtract';
-      changeSummary += `Quantity changed from ${currentItem.quantity} to ${newQuantity} (${changeType} ${Math.abs(parsedQty)}). `;
+      changeSummary += `Quantity changed from ${currentItem.quantity} to ${newQuantity} (${changeType} ${Math.abs(
+        parsedQty
+      )}). `;
     }
     if (isPriceUpdated) {
       changeSummary += `Price changed from RM ${currentItem.price} to RM ${newPrice}. `;
@@ -425,7 +417,7 @@ app.patch(
     }
     changeSummary = changeSummary.trim();
 
-    // 12. transaction_type
+    // 12. Determine transaction_type
     const changesCount = [
       isQuantityUpdated,
       isPriceUpdated,
@@ -456,19 +448,21 @@ app.patch(
           (item_id, user_id, transaction_type, quantity_change, timestamp, remarks, status, price_update, site_name, change_summary)
         VALUES
           ($1, $2, $3, $4, NOW(), $5, 'Approved', $6, $7, $8)
+        RETURNING *;
       `,
       [
         itemId,
         req.user.user_id,
         transactionType,
         isQuantityUpdated ? Math.abs(parseInt(quantityChange, 10)) : 0,
-        remarks || '',
+        remarks || '', // user remarks only
         isPriceUpdated ? newPrice : null,
         newSiteName,
-        changeSummary,
+        changeSummary, // store entire overview in change_summary
       ]
     );
 
+    // 14. Return the updated item and the change summary
     return res.json({
       message: 'Item updated successfully.',
       item: updatedItem,
@@ -483,9 +477,7 @@ app.delete(
   asyncHandler(async (req, res) => {
     const { itemIds } = req.body;
     if (!itemIds || !Array.isArray(itemIds) || itemIds.length === 0) {
-      return res
-        .status(400)
-        .json({ error: 'No items selected for archiving' });
+      return res.status(400).json({ error: 'No items selected for archiving' });
     }
     const itemsToArchive = await pool.query(
       `SELECT item_id, category, item_name, quantity, model, item_unique_id 
@@ -498,7 +490,6 @@ app.delete(
         .status(404)
         .json({ error: 'No items found or already archived' });
     }
-
     const archiveQuery = `
       UPDATE items
       SET archived_at = NOW(), updated_at = NOW()
@@ -506,7 +497,6 @@ app.delete(
       RETURNING item_id, item_name, quantity, category, model, item_unique_id
     `;
     const archiveResult = await pool.query(archiveQuery, [itemIds]);
-
     for (const item of archiveResult.rows) {
       await pool.query(
         `INSERT INTO inventory_transactions 
@@ -572,7 +562,7 @@ app.patch(
     const newReservedQuantity =
       itemDetails.reserved_quantity - updatedReservation.reserved_quantity;
 
-    // Insert transaction
+    // Log a transaction
     const transactionResult = await pool.query(
       `INSERT INTO inventory_transactions 
         (item_id, user_id, transaction_type, quantity_change, timestamp, remarks, status, price_update, site_name)
@@ -585,22 +575,24 @@ app.patch(
         by || 'Reservation completed',
       ]
     );
+    const transactionEntry = transactionResult.rows[0];
 
+    // Update item to reduce reserved quantity
     const updateItemResult = await pool.query(
       'UPDATE items SET reserved_quantity = $1, updated_at = NOW() WHERE item_id = $2 RETURNING *',
       [newReservedQuantity, updatedReservation.item_id]
     );
     if (updateItemResult.rowCount === 0) {
-      return res
-        .status(404)
-        .json({ message: 'Failed to update item reserved quantity' });
+      return res.status(404).json({
+        message: 'Failed to update item reserved quantity',
+      });
     }
     const updatedItem = updateItemResult.rows[0];
 
     res.json({
       message: 'Reservation completed successfully.',
       reservation: updatedReservation,
-      transaction: transactionResult.rows[0],
+      transaction: transactionEntry,
       updatedItem,
     });
   })
@@ -639,11 +631,12 @@ app.patch(
       const updatedReservedQuantity = currentReservedQuantity - reserved_quantity;
       const updatedQuantity = quantity + reserved_quantity;
 
-      // Update item
+      // Update item to restore quantity
       const updateItem = await pool.query(
         'UPDATE items SET reserved_quantity = $1, quantity = $2, updated_at = NOW() WHERE item_id = $3 RETURNING *',
         [updatedReservedQuantity, updatedQuantity, item_id]
       );
+      // Log transaction
       const transactionResult = await pool.query(
         `INSERT INTO inventory_transactions 
           (item_id, user_id, transaction_type, quantity_change, remarks, status, timestamp)
@@ -651,7 +644,9 @@ app.patch(
          RETURNING *`,
         [item_id, userId, reserved_quantity, by || 'Reservation canceled']
       );
+      const transactionEntry = transactionResult.rows[0];
 
+      // Mark reservation canceled
       const updateReservation = await pool.query(
         'UPDATE reservations SET reservation_status = $1, updated_at = NOW() WHERE reservation_id = $2 RETURNING *',
         ['Canceled', reservationId]
@@ -661,7 +656,7 @@ app.patch(
         message: 'Reservation canceled successfully, transaction logged.',
         item: updateItem.rows[0],
         reservation: updateReservation.rows[0],
-        transaction: transactionResult.rows[0],
+        transaction: transactionEntry,
       });
     } catch (error) {
       await pool.query('ROLLBACK');
@@ -703,6 +698,7 @@ app.get(
       ORDER BY 
         it.timestamp DESC;
     `;
+
     const { rows } = await pool.query(query);
     res.json({ logs: rows });
   })
@@ -788,10 +784,14 @@ app.post(
           [fileName, fileData, fileType, status, siteName]
         );
       }
-      res.json({ message: 'Files uploaded and saved to database successfully.' });
+      res.json({
+        message: 'Files uploaded and saved to database successfully.',
+      });
     } catch (error) {
       console.error('Error during file upload:', error);
-      res.status(500).json({ message: 'Internal Server Error', error: error.message });
+      res
+        .status(500)
+        .json({ message: 'Internal Server Error', error: error.message });
     }
   })
 );
@@ -808,7 +808,9 @@ app.get(
       res.json({ files: result.rows });
     } catch (error) {
       console.error('Error fetching file history:', error);
-      res.status(500).json({ message: 'Internal Server Error', error: error.message });
+      res
+        .status(500)
+        .json({ message: 'Internal Server Error', error: error.message });
     }
   })
 );
@@ -849,7 +851,10 @@ app.delete(
         .status(404)
         .json({ message: 'File not found or already deleted.' });
     }
-    res.json({ message: 'File deleted successfully.', file: result.rows[0] });
+    res.json({
+      message: 'File deleted successfully.',
+      file: result.rows[0],
+    });
   })
 );
 
@@ -877,7 +882,10 @@ app.put(
     if (result.rowCount === 0) {
       return res.status(404).json({ message: 'File not found.' });
     }
-    res.json({ message: 'File updated successfully.', file: result.rows[0] });
+    res.json({
+      message: 'File updated successfully.',
+      file: result.rows[0],
+    });
   })
 );
 
@@ -895,7 +903,10 @@ app.post(
         .json({ message: 'Invalid payload: items array required.' });
     }
     for (const { itemId, qty } of items) {
-      const { rows } = await pool.query('SELECT quantity FROM items WHERE item_id = $1', [itemId]);
+      const { rows } = await pool.query(
+        'SELECT quantity FROM items WHERE item_id = $1',
+        [itemId]
+      );
       if (rows.length === 0) {
         return res
           .status(404)
